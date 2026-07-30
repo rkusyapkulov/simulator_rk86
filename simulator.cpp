@@ -27,6 +27,7 @@ BYTE system_ram[65536];    // Полное адресное пространст
 BYTE font_rom[2048];       // ПЗУ Знакогенератора (2 Кб)
 BYTE rom_disk_storage[32768]; // Буфер для хранения файла "rom.bin"
 BYTE key_matrix_state[8];  // Состояние шин клавиатуры (Индекс = Столбец PA, Биты = Строки PB)
+bool emulator_running = true;
 
 // Состояния модификаторов (true = нажато/заземлено, false = разомкнуто)
 bool rk_cc_pressed = false;       // CC (Shift) -> Подключена к PC5
@@ -48,6 +49,9 @@ struct CPU8080 {
 	WORD PC, SP;
 	bool S, Z, AC, P, CY;
 	bool EI;
+	bool halted; // <-- ДОБАВИТЬ: флаг останова процессора
+	int cycles_until_interrupt = 35600; // 1780000 Гц / 50 Гц = 35600 тактов на кадр
+	bool int_pending = false;           // Флаг того, что прерывание пришло от дисплея
 
 	// Порты КР580ВВ55 (ППА)
 	BYTE ppi_pa, ppi_pb, ppi_pc, ppi_ctrl;
@@ -59,7 +63,6 @@ struct CPU8080 {
 	BYTE dma_status;
 	BYTE dma_command;
 	bool dma_flip_flop;
-	unsigned int frame_ticks;
 
 	// Состояние КР580ВГ75 (Видеоконтроллер)
 	BYTE vgh75_status;
@@ -86,6 +89,7 @@ struct CPU8080 {
 		A = B = C = D = E = H = L = 0;
 		S = Z = AC = P = CY = false;
 		EI = false;
+		halted = false; // <-- ДОБАВИТЬ: сброс флага при перезагрузке
 		ppi_pa = ppi_pb = ppi_pc = 0xFF; ppi_ctrl = 0x9B;
 		ppi1_pa = ppi1_pb = ppi1_pc = 0xFF; ppi1_ctrl = 0x9B;
 
@@ -93,7 +97,6 @@ struct CPU8080 {
 		for (int i = 0; i < 4; i++) { dma_ch_addr[i] = 0; dma_ch_count[i] = 0; }
 		dma_ch_addr[2] = 0x76D0; // Канал 2 по умолчанию отвечает за экран РК
 		dma_command = 0; dma_status = 0; dma_flip_flop = false;
-		frame_ticks = 0;
 
 		// Настройка видеоконтроллера
 		vgh75_status = 0x00; vgh75_command = 0x00; vgh75_param_count = 0; vgh75_vblank_state = false;
@@ -114,7 +117,6 @@ struct CPU8080 {
 		BYTE Ty = res;
 		Ty ^= Ty >> 4; Ty ^= Ty >> 2; Ty ^= Ty >> 1;
 		P = !(Ty & 1);
-		// CY НЕ изменяется здесь!
 	}
 
 	void SetFlagsINR(BYTE old_val, BYTE new_val) {
@@ -371,11 +373,28 @@ struct CPU8080 {
 		}
 	}
 
-	// --- ПОЛНАЯ РЕАЛИЗАЦИЯ ИНТЕРПРЕТАТОРА ССЫЛОК И СМЕЩЕНИЙ ЯДРА 256 ИНСТРУКЦИЙ ---
-	void Step() {
-		frame_ticks++;
-		if (frame_ticks >= 35600) {
-			frame_ticks = 0;
+	int Step() {
+		// Таблица базовых тактов для всех 256 инструкций Intel 8080
+		static const int lut_cycles[256] = {
+			4, 10, 7,  5,  5,  5,  7,  4,  4, 10, 7,  5,  5,  5,  7,  4,  // 00-0F
+			4, 10, 7,  5,  5,  5,  7,  4,  4, 10, 7,  5,  5,  5,  7,  4,  // 10-1F
+			4, 10, 16, 5,  5,  5,  7,  4,  4, 10, 16, 5,  5,  5,  7,  4,  // 20-2F
+			4, 10, 13, 5,  10, 10, 10, 4,  4, 10, 13, 5,  5,  5,  7,  4,  // 30-3F
+			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 40-4F
+			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 50-5F
+			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 60-6F
+			7, 7,  7,  7,  7,  7,  7,  7,  5, 5,  5,  5,  5,  5,  7,  5,  // 70-7F
+			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // 80-8F
+			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // 90-9F
+			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // A0-AF
+			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // B0-BF
+			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // C0-CF
+			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // D0-DF
+			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // E0-EF
+			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11  // F0-FF
+		};
+
+		if (int_pending) {
 			vgh75_vblank_state = !vgh75_vblank_state;
 			if (vgh75_vblank_state) {
 				vgh75_status |= 0x20; // Выставляем флаг конца кадра
@@ -384,143 +403,251 @@ struct CPU8080 {
 				vgh75_status &= ~0x20;
 			}
 		}
-		BYTE op = Read(PC++);
-		if ((op & 0xC0) == 0x40 && op != 0x76) {
-			// Быстрая обработка группы MOV R, R
-			SetReg((op >> 3) & 7, GetReg(op & 7));
-			return;
+
+		// 1. Проверяем аппаратное прерывание перед декодированием инструкции
+		if (int_pending && EI) {
+			int_pending = false;
+
+			BYTE opcode = system_ram[0x0038];
+			// УМНАЯ ЗАГЛУШКА: Если на векторе пусто или там RET, просто гасим триггер прерываний
+			if (opcode == 0x00 || opcode == 0xC9) {
+				EI = false; // КРИТИЧЕСКИ ВАЖНО: прерывания должны запрещаться при обработке!
+				halted = false; // Прерывание выводит процессор из HLT даже если там заглушка
+				return 4;   // Возвращаем базовые 4 такта (как на холостой цикл), а не 0!
+			}
+
+			// Честное аппаратное прерывание по стандарту Intel 8080 (эквивалент команды RST 7)
+			EI = false;
+			halted = false;
+			Write(--SP, PC >> 8);
+			Write(--SP, PC & 0xFF);
+			PC = 0x0038;
+			return 11; // RST 7 занимает ровно 11 тактов
 		}
+
+		// 2. Если процессор в состоянии HLT
+		if (halted) {
+			int_pending = false; // Если прерывания запрещены, HLT вечный, но кадровый счетчик сбрасываем
+			return 4; // Будем возвращать по 4 такта
+		}
+
+//        WORD current_pc_before_fetch = PC; // Сохраняем адрес текущей инструкции
+		BYTE op = Read(PC++);
+		int cycles = lut_cycles[op];
+
+		// СОХРАНЯЕМ ТЕКУЩИЙ ШАГ В ЦИКЛИЧЕСКИЙ БУФЕР
+//        LogTraceStep(current_pc_before_fetch, op, SP, GetHL(), GetBC(), GetDE(), A);
+
+		// Группа команд MOV r1, r2 (исключая MOV M, M, которая является HLT 0x76)
+		if ((op & 0xC0) == 0x40 && op != 0x76) {
+			SetReg((op >> 3) & 7, GetReg(op & 7));
+			return cycles;
+		}
+
 		switch (op) {
+			// NOP инструкции
 		case 0x00: case 0x08: case 0x10: case 0x18: case 0x20: case 0x28:
-		case 0x30: case 0x38: return;
-		case 0x76: PC--; return;
-		case 0x06: B = Read(PC++); return; case 0x0E: C = Read(PC++); return;
-		case 0x16: D = Read(PC++); return; case 0x1E: E = Read(PC++); return;
-		case 0x26: H = Read(PC++); return; case 0x2E: L = Read(PC++); return;
-		case 0x36: Write(GetHL(), Read(PC++)); return;
-		case 0x3E: A = Read(PC++); return;
-		case 0x01: { WORD l = Read(PC++); WORD h = Read(PC++); SetBC((h << 8) | l); return; }
-		case 0x11: { WORD l = Read(PC++); WORD h = Read(PC++); SetDE((h << 8) | l); return; }
-		case 0x21: { WORD l = Read(PC++); WORD h = Read(PC++); SetHL((h << 8) | l); return; }
-		case 0x31: { WORD l = Read(PC++); WORD h = Read(PC++); SP = (h << 8) | l; return; }
+		case 0x30: case 0x38: return cycles;
+
+			// Останавливаем процессор до аппаратного прерывания
+		case 0x76: halted = true; return cycles;
+
+			// MVI r, imm
+		case 0x06: B = Read(PC++); return cycles;
+		case 0x0E: C = Read(PC++); return cycles;
+		case 0x16: D = Read(PC++); return cycles;
+		case 0x1E: E = Read(PC++); return cycles;
+		case 0x26: H = Read(PC++); return cycles;
+		case 0x2E: L = Read(PC++); return cycles;
+		case 0x36: Write(GetHL(), Read(PC++)); return cycles;
+		case 0x3E: A = Read(PC++); return cycles;
+
+			// LXI rp, imm
+		case 0x01: { WORD l = Read(PC++); WORD h = Read(PC++); SetBC((h << 8) | l); return cycles; }
+		case 0x11: { WORD l = Read(PC++); WORD h = Read(PC++); SetDE((h << 8) | l); return cycles; }
+		case 0x21: { WORD l = Read(PC++); WORD h = Read(PC++); SetHL((h << 8) | l); return cycles; }
+		case 0x31: { WORD l = Read(PC++); WORD h = Read(PC++); SP = (h << 8) | l; return cycles; }
+
+				 // ADD r
 		case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
-		case 0x86: case 0x87: { BYTE src = GetReg(op & 7); int r = A + src; SetFlagsAdd(A, src, r); A = (BYTE)r; return; }
+		case 0x86: case 0x87: { BYTE src = GetReg(op & 7); int r = A + src; SetFlagsAdd(A, src, r); A = (BYTE)r; return cycles; }
+
+				 // ADC r
 		case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D:
-		case 0x8E: case 0x8F: { BYTE src = GetReg(op & 7); int r = A + src + (CY ? 1 : 0); SetFlagsAdd(A, src, r); A = (BYTE)r; return; }
+		case 0x8E: case 0x8F: { BYTE src = GetReg(op & 7); int r = A + src + (CY ? 1 : 0); SetFlagsAdd(A, src, r); A = (BYTE)r; return cycles; }
+
+				 // SUB r
 		case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
-		case 0x96: case 0x97: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); A = (BYTE)r; return; }
+		case 0x96: case 0x97: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); A = (BYTE)r; return cycles; }
+
+				 // SBB r
 		case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D:
-		case 0x9E: case 0x9F: { BYTE src = GetReg(op & 7); int r = A - src + (CY ? -1 : 0); SetFlagsSub(A, src, r); A = (BYTE)r; return; }
+		case 0x9E: case 0x9F: { BYTE src = GetReg(op & 7); int r = A - src - (CY ? 1 : 0); SetFlagsSub(A, src, r); A = (BYTE)r; return cycles; }
+
+				 // ANA r
 		case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5:
-		case 0xA6: case 0xA7: { A &= GetReg(op & 7); CY = false; AC = true; SetFlagsZSP(A); return; }
+		case 0xA6: case 0xA7: { A &= GetReg(op & 7); CY = false; AC = true; SetFlagsZSP(A); return cycles; }
+
+				 // XRA r
 		case 0xA8: case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
-		case 0xAE: case 0xAF: { A ^= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return; }
+		case 0xAE: case 0xAF: { A ^= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
+
+				 // ORA r
 		case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5:
-		case 0xB6: case 0xB7: { A |= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return; }
+		case 0xB6: case 0xB7: { A |= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
+
+				 // CMP r
 		case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD:
-		case 0xBE: case 0xBF: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); return; }
-		case 0xC6: { BYTE imm = Read(PC++); int r = A + imm; SetFlagsAdd(A, imm, r); A = (BYTE)r; return; }
-		case 0xCE: { BYTE imm = Read(PC++); int r = A + imm + (CY ? 1 : 0); SetFlagsAdd(A, imm, r); A = (BYTE)r; return; }
-		case 0xD6: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); A = (BYTE)r; return; }
-		case 0xDE: { BYTE imm = Read(PC++); int r = A - imm - (CY ? 1 : 0); SetFlagsSub(A, imm, r); A = (BYTE)r; return; }
-		case 0xE6: { A &= Read(PC++); CY = false; AC = true; SetFlagsZSP(A); return; }
-		case 0xEE: { A ^= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return; }
-		case 0xF6: { A |= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return; }
-		case 0xFE: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); return; }
-		case 0xC3: { WORD l = Read(PC++); WORD h = Read(PC++); PC = (h << 8) | l; return; }
-		case 0xCD: { WORD l = Read(PC++); WORD h = Read(PC++); Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; return; }
-		case 0xC9: { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; return; }
-		case 0xC0: if (!Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xC8: if (Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xD0: if (!CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xD8: if (CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xE0: if (!P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xE8: if (P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xF0: if (!S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xF8: if (S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; } return;
-		case 0xC2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { PC = (h << 8) | l; } return; }
-		case 0xCA: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { PC = (h << 8) | l; } return; }
-		case 0xD2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { PC = (h << 8) | l; } return; }
-		case 0xDA: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { PC = (h << 8) | l; } return; }
-		case 0xE2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { PC = (h << 8) | l; } return; }
-		case 0xEA: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { PC = (h << 8) | l; } return; }
-		case 0xF2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { PC = (h << 8) | l; } return; }
-		case 0xFA: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { PC = (h << 8) | l; } return; }
-		case 0xC4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xCC: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xD4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xDC: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xE4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xEC: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xF4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0xFC: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; } return; }
-		case 0x03: SetBC(GetBC() + 1); return; case 0x13: SetDE(GetDE() + 1); return;
-		case 0x23: SetHL(GetHL() + 1); return; case 0x33: SP++; return;
-		case 0x0B: SetBC(GetBC() - 1); return; case 0x1B: SetDE(GetDE() - 1); return;
-		case 0x2B: SetHL(GetHL() - 1); return; case 0x3B: SP--; return;
-		case 0x04: { BYTE old = B; B++; SetFlagsINR(old, B); return; } case 0x05: { BYTE old = B; B--; SetFlagsDCR(old, B); return; }
-		case 0x0C: { BYTE old = C; C++; SetFlagsINR(old, C); return; } case 0x0D: { BYTE old = C; C--; SetFlagsDCR(old, C); return; }
-		case 0x14: { BYTE old = D; D++; SetFlagsINR(old, D); return; } case 0x15: { BYTE old = D; D--; SetFlagsDCR(old, D); return; }
-		case 0x1C: { BYTE old = E; E++; SetFlagsINR(old, E); return; } case 0x1D: { BYTE old = E; E--; SetFlagsDCR(old, E); return; }
-		case 0x24: { BYTE old = H; H++; SetFlagsINR(old, H); return; } case 0x25: { BYTE old = H; H--; SetFlagsDCR(old, H); return; }
-		case 0x2C: { BYTE old = L; L++; SetFlagsINR(old, L); return; } case 0x2D: { BYTE old = L; L--; SetFlagsDCR(old, L); return; }
-		case 0x34: { BYTE old = Read(GetHL()); BYTE v = old + 1; Write(GetHL(), v); SetFlagsINR(old, v); return; }
-		case 0x35: { BYTE old = Read(GetHL()); BYTE v = old - 1; Write(GetHL(), v); SetFlagsDCR(old, v); return; }
-		case 0x3C: { BYTE old = A; A++; SetFlagsINR(old, A); return; } case 0x3D: { BYTE old = A; A--; SetFlagsDCR(old, A); return; }
-		case 0x09: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetBC(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return; }
-		case 0x19: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetDE(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return; }
-		case 0x29: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetHL(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return; }
-		case 0x39: { unsigned int r = (unsigned int)GetHL() + (unsigned int)SP; CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return; }
-		case 0xC5: Write(--SP, B); Write(--SP, C); return;
-		case 0xD5: Write(--SP, D); Write(--SP, E); return;
-		case 0xE5: Write(--SP, H); Write(--SP, L); return;
-		case 0xF5: { BYTE psw = (S << 7) | (Z << 6) | (0 << 5) | (AC << 4) | (0 << 3) | (P << 2) | (2) | (CY ? 1 : 0); Write(--SP, A); Write(--SP, psw); return; }
-		case 0xC1: C = Read(SP++); B = Read(SP++); return;
-		case 0xD1: E = Read(SP++); D = Read(SP++); return;
-		case 0xE1: L = Read(SP++); H = Read(SP++); return;
-		case 0xF1: { BYTE psw = Read(SP++); A = Read(SP++); S = (psw & 0x80) != 0; Z = (psw & 0x40) != 0; AC = (psw & 0x10) != 0; P = (psw & 0x04) != 0; CY = (psw & 0x01) != 0; return; }
-		case 0x32: { WORD l = Read(PC++); WORD h = Read(PC++); Write((h << 8) | l, A); return; }
-		case 0x3A: { WORD l = Read(PC++); WORD h = Read(PC++); A = Read((h << 8) | l); return; }
-		case 0x22: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; Write(a, L); Write(a + 1, H); return; }
-		case 0x2A: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; L = Read(a); H = Read(a + 1); return; }
-		case 0x02: Write(GetBC(), A); return; case 0x12: Write(GetDE(), A); return;
-		case 0x0A: A = Read(GetBC()); return; case 0x1A: A = Read(GetDE()); return;
-		case 0x07: { CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (CY ? 1 : 0)) & 0xFF); return; }
-		case 0x0F: { CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (CY ? 0x80 : 0)) & 0xFF); return; }
-		case 0x17: { bool old_cy = CY; CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (old_cy ? 1 : 0)) & 0xFF); return; }
-		case 0x1F: { bool old_cy = CY; CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (old_cy ? 0x80 : 0)) & 0xFF); return; }
-		case 0xC7: case 0xCF: case 0xD7: case 0xDF: case 0xE7: case 0xEF: case 0xF7: case 0xFF: Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (op & 0x38); return;
+		case 0xBE: case 0xBF: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); return cycles; }
+
+				 // Операции с непосредственным значением (Иммедиат)
+		case 0xC6: { BYTE imm = Read(PC++); int r = A + imm; SetFlagsAdd(A, imm, r); A = (BYTE)r; return cycles; }
+		case 0xCE: { BYTE imm = Read(PC++); int r = A + imm + (CY ? 1 : 0); SetFlagsAdd(A, imm, r); A = (BYTE)r; return cycles; }
+		case 0xD6: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); A = (BYTE)r; return cycles; }
+		case 0xDE: { BYTE imm = Read(PC++); int r = A - imm - (CY ? 1 : 0); SetFlagsSub(A, imm, r); A = (BYTE)r; return cycles; }
+		case 0xE6: { A &= Read(PC++); CY = false; AC = true; SetFlagsZSP(A); return cycles; }
+		case 0xEE: { A ^= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
+		case 0xF6: { A |= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
+		case 0xFE: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); return cycles; }
+
+				 // Безусловные JMP / CALL / RET
+		case 0xC3: { WORD l = Read(PC++); WORD h = Read(PC++); PC = (h << 8) | l; return cycles; }
+		case 0xCD: { WORD l = Read(PC++); WORD h = Read(PC++); Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; return cycles; }
+		case 0xC9: { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; return cycles; }
+
+				 // Возвраты по условию (При переходе тратится 11 тактов вместо 5 базовых)
+		case 0xC0: if (!Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xC8: if (Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xD0: if (!CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xD8: if (CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xE0: if (!P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xE8: if (P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xF0: if (!S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+		case 0xF8: if (S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
+
+			// Переходы по условию (Всегда занимают 10 тактов в 8080)
+		case 0xC2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { PC = (h << 8) | l; } return cycles; }
+		case 0xCA: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { PC = (h << 8) | l; } return cycles; }
+		case 0xD2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { PC = (h << 8) | l; } return cycles; }
+		case 0xDA: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { PC = (h << 8) | l; } return cycles; }
+		case 0xE2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { PC = (h << 8) | l; } return cycles; }
+		case 0xEA: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { PC = (h << 8) | l; } return cycles; }
+		case 0xF2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { PC = (h << 8) | l; } return cycles; }
+		case 0xFA: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { PC = (h << 8) | l; } return cycles; }
+
+				 // Вызовы по условию (При вызове тратится 17 тактов вместо 11 базовых)
+		case 0xC4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xCC: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xD4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xDC: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xE4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xEC: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xF4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+		case 0xFC: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
+
+				 // INX / DCX
+		case 0x03: SetBC(GetBC() + 1); return cycles;
+		case 0x13: SetDE(GetDE() + 1); return cycles;
+		case 0x23: SetHL(GetHL() + 1); return cycles;
+		case 0x33: SP++; return cycles;
+		case 0x0B: SetBC(GetBC() - 1); return cycles;
+		case 0x1B: SetDE(GetDE() - 1); return cycles;
+		case 0x2B: SetHL(GetHL() - 1); return cycles;
+		case 0x3B: SP--; return cycles;
+
+			// INR / DCR
+		case 0x04: { BYTE old = B; B++; SetFlagsINR(old, B); return cycles; }
+		case 0x05: { BYTE old = B; B--; SetFlagsDCR(old, B); return cycles; }
+		case 0x0C: { BYTE old = C; C++; SetFlagsINR(old, C); return cycles; }
+		case 0x0D: { BYTE old = C; C--; SetFlagsDCR(old, C); return cycles; }
+		case 0x14: { BYTE old = D; D++; SetFlagsINR(old, D); return cycles; }
+		case 0x15: { BYTE old = D; D--; SetFlagsDCR(old, D); return cycles; }
+		case 0x1C: { BYTE old = E; E++; SetFlagsINR(old, E); return cycles; }
+		case 0x1D: { BYTE old = E; E--; SetFlagsDCR(old, E); return cycles; }
+		case 0x24: { BYTE old = H; H++; SetFlagsINR(old, H); return cycles; }
+		case 0x25: { BYTE old = H; H--; SetFlagsDCR(old, H); return cycles; }
+		case 0x2C: { BYTE old = L; L++; SetFlagsINR(old, L); return cycles; }
+		case 0x2D: { BYTE old = L; L--; SetFlagsDCR(old, L); return cycles; }
+		case 0x34: { BYTE old = Read(GetHL()); BYTE v = old + 1; Write(GetHL(), v); SetFlagsINR(old, v); return cycles; }
+		case 0x35: { BYTE old = Read(GetHL()); BYTE v = old - 1; Write(GetHL(), v); SetFlagsDCR(old, v); return cycles; }
+		case 0x3C: { BYTE old = A; A++; SetFlagsINR(old, A); return cycles; }
+		case 0x3D: { BYTE old = A; A--; SetFlagsDCR(old, A); return cycles; }
+
+				 // DAD rp
+		case 0x09: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetBC(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
+		case 0x19: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetDE(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
+		case 0x29: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetHL(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
+		case 0x39: { unsigned int r = (unsigned int)GetHL() + (unsigned int)SP;    CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
+
+				 // PUSH / POP
+		case 0xC5: Write(--SP, B); Write(--SP, C); return cycles;
+		case 0xD5: Write(--SP, D); Write(--SP, E); return cycles;
+		case 0xE5: Write(--SP, H); Write(--SP, L); return cycles;
+		case 0xF5: { BYTE psw = (S << 7) | (Z << 6) | (0 << 5) | (AC << 4) | (0 << 3) | (P << 2) | (2) | (CY ? 1 : 0); Write(--SP, A); Write(--SP, psw); return cycles; }
+		case 0xC1: C = Read(SP++); B = Read(SP++); return cycles;
+		case 0xD1: E = Read(SP++); D = Read(SP++); return cycles;
+		case 0xE1: L = Read(SP++); H = Read(SP++); return cycles;
+		case 0xF1: { BYTE psw = Read(SP++); A = Read(SP++); S = (psw & 0x80) != 0; Z = (psw & 0x40) != 0; AC = (psw & 0x10) != 0; P = (psw & 0x04) != 0; CY = (psw & 0x01) != 0; return cycles; }
+
+				 // Прямая адресация (STA, LDA, SHLD, LHLD)
+		case 0x32: { WORD l = Read(PC++); WORD h = Read(PC++); Write((h << 8) | l, A); return cycles; }
+		case 0x3A: { WORD l = Read(PC++); WORD h = Read(PC++); A = Read((h << 8) | l); return cycles; }
+		case 0x22: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; Write(a, L); Write(a + 1, H); return cycles; }
+		case 0x2A: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; L = Read(a); H = Read(a + 1); return cycles; }
+
+				 // Косвенная адресация
+		case 0x02: Write(GetBC(), A); return cycles;
+		case 0x12: Write(GetDE(), A); return cycles;
+		case 0x0A: A = Read(GetBC()); return cycles;
+		case 0x1A: A = Read(GetDE()); return cycles;
+
+			// Циклические сдвиги аккумулятора
+		case 0x07: { CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (CY ? 1 : 0)) & 0xFF); return cycles; }
+		case 0x0F: { CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (CY ? 0x80 : 0)) & 0xFF); return cycles; }
+		case 0x17: { bool old_cy = CY; CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (old_cy ? 1 : 0)) & 0xFF); return cycles; }
+		case 0x1F: { bool old_cy = CY; CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (old_cy ? 0x80 : 0)) & 0xFF); return cycles; }
+
+				 // RST 0 - RST 7
+		case 0xC7: case 0xCF: case 0xD7: case 0xDF: case 0xE7: case 0xEF: case 0xF7: case 0xFF:
+			Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (op & 0x38); return cycles;
+
 			// OUT port
 		case 0xD3: {
 			BYTE port = Read(PC++);
 			WORD target_addr = (port << 8) | port; // Аппаратное дублирование байта порта
 			Write(target_addr, A);                 // Перенаправляем запись в память (в область портов)
-			return;
+			return cycles;
 		}
+
 				 // IN port
 		case 0xDB: {
 			BYTE port = Read(PC++);
 			WORD target_addr = (port << 8) | port; // Аппаратное дублирование байта порта
 			A = Read(target_addr);                 // Читаем из памяти как из порта
-			return;
+			return cycles;
 		}
+
+				 // Десятичная коррекция аккумулятора (DAA)
 		case 0x27: {
 			BYTE corr = 0; bool new_cy = CY;
 			if ((A & 0x0F) > 9 || AC) corr |= 0x06;
 			if (A > 0x99 || CY) { corr |= 0x60; new_cy = true; }
 			int res = A + corr; AC = ((A & 0x0F) + (corr & 0x0F)) > 0x0F;
-			A = (BYTE)res; CY = new_cy; SetFlagsZSP(A); return;
+			A = (BYTE)res; CY = new_cy; SetFlagsZSP(A); return cycles;
 		}
-		case 0x2F: A = (BYTE)(~A & 0xFF); return;
-		case 0x37: CY = true; return;
-		case 0x3F: CY = !CY; return;
-		case 0xEB: { BYTE t = D; D = H; H = t; t = E; E = L; L = t; return; }
-		case 0xE3: { BYTE l = Read(SP); BYTE h = Read(SP + 1); Write(SP, L); Write(SP + 1, H); L = l; H = h; return; }
-		case 0xF9: SP = GetHL(); return;
-		case 0xE9: PC = GetHL(); return;
-		case 0xFB: EI = true; return;
-		case 0xF3: EI = false; return;
+
+				 // Специальные команды
+		case 0x2F: A = (BYTE)(~A & 0xFF); return cycles;
+		case 0x37: CY = true; return cycles;
+		case 0x3F: CY = !CY; return cycles;
+		case 0xEB: { BYTE t = D; D = H; H = t; t = E; E = L; L = t; return cycles; }
+		case 0xE3: { BYTE l = Read(SP); BYTE h = Read(SP + 1); Write(SP, L); Write(SP + 1, H); L = l; H = h; return cycles; }
+		case 0xF9: SP = GetHL(); return cycles;
+		case 0xE9: PC = GetHL(); return cycles;
+		case 0xFB: EI = true; return cycles;
+		case 0xF3: EI = false; return cycles;
 		}
+		return cycles;
 	}
 };
 #pragma pack(pop)
@@ -870,6 +997,7 @@ void LoadRKFile(HWND hwnd) {
 	}
 }
 
+int static_virtual_key_duration = 0; // Наш счетчик автоотжатия кнопок мыши
 const int HARDWARE_MAP_SIZE = sizeof(rk_hardware_map) / sizeof(rk_hardware_map[0]);
 
 // =========================================================================
@@ -908,8 +1036,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		return DefWindowProcW(hwnd, msg, wp, lp);
 	}
 	case WM_COMMAND: {
-		// Обработка кнопки СБРОС
-		if (LOWORD(wp) == 2000) {
+		int btn_id = LOWORD(wp);
+
+		// 1. Обработка кнопки СБРОС (RESET)
+		if (btn_id == 2000) {
 			cpu.Reset();
 			for (int i = 0; i < 8; i++) key_matrix_state[i] = 0xFF;
 			UpdateRegisterDisplay();
@@ -917,56 +1047,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			return 0;
 		}
 
-		// --- ОБРАБОТКА СИСТЕМНОГО МЕНЮ ФАЙЛА ---
-		switch (LOWORD(wp)) {
-		case IDM_FILE_OPEN:
-			LoadRKFile(hwnd);
-			return 0;
-		case IDM_FILE_EXIT:
-			DestroyWindow(hwnd);
-			return 0;
-		}
-		break;
-	}
-	case WM_PARENTNOTIFY: {
-		if (LOWORD(wp) == WM_LBUTTONDOWN) {
-			POINT pt; pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
-			HWND child = ChildWindowFromPoint(hwnd, pt);
-			int btn_id = GetDlgCtrlID(child);
-			int btn_idx = btn_id - 1000;
+		// 2. Обработка виртуальных клавиш клавиатуры (ID от 1000 до 1071)
+		int btn_idx = btn_id - 1000;
+		if (btn_idx >= 0 && btn_idx < HARDWARE_MAP_SIZE) {
+			UINT target_vk = 0;
 
-			// ИСПРАВЛЕНО: Строгая проверка на границы действительного массива
-			if (btn_idx >= 0 && btn_idx < HARDWARE_MAP_SIZE) {
-				if (btn_idx == 57) {
-					rk_rus_lat_pressed = true;
-					for (int step = 0; step < 15000; step++) cpu.Step();
-					rk_rus_lat_pressed = false;
-				}
-				else if (btn_idx == 45) {
-					rk_cc_pressed = true;
-					for (int step = 0; step < 15000; step++) cpu.Step();
-					rk_cc_pressed = false;
-				}
-				else if (btn_idx == 30) {
-					rk_us_pressed = true;
-					for (int step = 0; step < 15000; step++) cpu.Step();
-					rk_us_pressed = false;
-				}
-				else {
+			// Находим соответствующий Virtual Key (VK) для этой кнопки
+			for (int vk_test = 0; vk_test < 256; vk_test++) {
+				int r = -1, c = -1;
+				if (MapVirtualKeyToRK(vk_test, r, c)) {
 					int hw_code = rk_hardware_map[btn_idx];
-					if (hw_code != 0) { // Исключаем пустые заглушки
-						int pa_line_col = hw_code / 8;
-						int pb_line_row = hw_code % 8;
-						key_matrix_state[pa_line_col] &= ~(1 << pb_line_row);
-						for (int step = 0; step < 15000; step++) cpu.Step();
-						key_matrix_state[pa_line_col] |= (1 << pb_line_row);
+					if ((hw_code / 8 == r) && (hw_code % 8 == c)) {
+						target_vk = vk_test;
+						break;
 					}
 				}
-				SetFocus(hwnd);
-				UpdateRegisterDisplay();
-				InvalidateRect(hwnd, NULL, FALSE);
-				return 0;
 			}
+
+			// Ручной маппинг системных модификаторов
+			if (btn_idx == 57) target_vk = VK_CAPITAL;      // РУС/ЛАТ
+			else if (btn_idx == 45) target_vk = VK_SHIFT;   // СС
+			else if (btn_idx == 30) target_vk = VK_CONTROL; // УС
+
+			// Если кнопка валидна — зажимаем её в матрице НАПРЯМУЮ
+			if (target_vk != 0) {
+				// Выделяем 4 кадра удержания (~80 мс), чтобы процессор точно успел считать её
+				static_virtual_key_duration = 4;
+
+				if (target_vk == VK_CAPITAL) { rk_rus_lat_pressed = true; }
+				else if (target_vk == VK_SHIFT) { rk_cc_pressed = true; }
+				else if (target_vk == VK_CONTROL) { rk_us_pressed = true; }
+				else {
+					int r = -1, c = -1;
+					if (MapVirtualKeyToRK(target_vk, r, c)) {
+						if (r >= 0 && r < 8) {
+							key_matrix_state[r] &= ~(1 << c); // Замыкаем контакт напрямую
+						}
+					}
+				}
+			}
+
+			// Возвращаем фокус на главное окно, чтобы продолжала работать физическая клавиатура
+			SetFocus(hwnd);
+			return 0;
 		}
 		break;
 	}
@@ -1097,84 +1220,110 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 		}
 	}
 
+
 	MSG msg;
-	static LARGE_INTEGER frequency;
-	static LARGE_INTEGER last_hardware_time;
-	static double internal_cycles_debt = 0.0;
+	LARGE_INTEGER frequency;
+	LARGE_INTEGER last_hardware_time;
+	double internal_cycles_debt = 0.0;
+
 	QueryPerformanceFrequency(&frequency);
 	QueryPerformanceCounter(&last_hardware_time);
 
-	while (true) {
-		if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
-			if (msg.message == WM_QUIT) break;
+	const double SYSTEM_CLOCK_HZ = 1780000.0; // Частота ядра Радио-86РК (1.78 МГц)
+	double time_since_last_interrupt = 0.0;
 
+	while (emulator_running) {
+		// Ожидание системных событий во избежание 100% загрузки процессора ПК
+		MsgWaitForMultipleObjectsEx(0, NULL, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+		while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+			if (msg.message == WM_QUIT) {
+				emulator_running = false;
+				break;
+			}
+
+			// --- НАЖАТИЕ КЛАВИШ (WM_KEYDOWN) ---
 			if (msg.message == WM_KEYDOWN) {
-				// Обрабатываем только первое нажатие (исключаем автоповтор Windows)
-				if (!(msg.lParam & (1 << 30))) {
+				if (!(msg.lParam & (1 << 30))) { // Защита от автоповтора Windows
 					UINT vk = (UINT)msg.wParam;
-					bool handled = false;
-
-					if (vk == VK_CAPITAL) {
-						rk_rus_lat_pressed = true;
-						for (int step = 0; step < 15000; step++) cpu.Step();
-						rk_rus_lat_pressed = false;
-						handled = true;
-					}
-					else if (vk == VK_SHIFT) {
-						rk_cc_pressed = true;
-						for (int step = 0; step < 15000; step++) cpu.Step();
-						rk_cc_pressed = false;
-						handled = true;
-					}
-					else if (vk == VK_CONTROL) {
-						rk_us_pressed = true;
-						for (int step = 0; step < 15000; step++) cpu.Step();
-						rk_us_pressed = false;
-						handled = true;
-					}
+					if (vk == VK_CAPITAL) { rk_rus_lat_pressed = true; }
+					else if (vk == VK_SHIFT) { rk_cc_pressed = true; }
+					else if (vk == VK_CONTROL) { rk_us_pressed = true; }
 					else {
 						int target_row = -1, target_col = -1;
 						if (MapVirtualKeyToRK(vk, target_row, target_col)) {
 							key_matrix_state[target_row] &= ~(1 << target_col);
-							for (int step = 0; step < 15000; step++) cpu.Step();
-							key_matrix_state[target_row] |= (1 << target_col);
-							handled = true;
 						}
 					}
+				}
+			}
 
-					if (handled) {
+			// --- ОТПУСКАНИЕ КЛАВИШ (WM_KEYUP) ---
+			else if (msg.message == WM_KEYUP) {
+				UINT vk = (UINT)msg.wParam;
+				if (vk == VK_CAPITAL) { rk_rus_lat_pressed = false; }
+				else if (vk == VK_SHIFT) { rk_cc_pressed = false; }
+				else if (vk == VK_CONTROL) { rk_us_pressed = false; }
+				else {
+					int target_row = -1, target_col = -1;
+					if (MapVirtualKeyToRK(vk, target_row, target_col)) {
+						key_matrix_state[target_row] |= (1 << target_col); // Размыкаем контакт
+					}
+				}
+			}
+
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+
+		if (!emulator_running) break;
+
+		// --- ДИСПЕТЧЕР И ТАКТОВАЯ СИНХРОНИЗАЦИЯ ЯДРА ---
+		LARGE_INTEGER current_hardware_time;
+		QueryPerformanceCounter(&current_hardware_time);
+		double elapsed_seconds = (double)(current_hardware_time.QuadPart - last_hardware_time.QuadPart) / frequency.QuadPart;
+
+		if (elapsed_seconds > 0.1) elapsed_seconds = 0.1; // Защита от лагов Windows
+
+		if (elapsed_seconds > 0.0) {
+			last_hardware_time = current_hardware_time;
+			internal_cycles_debt += elapsed_seconds * SYSTEM_CLOCK_HZ; // Накапливаем такты ПК
+
+			int cycles_to_execute = (int)internal_cycles_debt;
+			if (cycles_to_execute > 0) {
+				while (cycles_to_execute > 0) {
+					int elapsed_ticks = cpu.Step();
+
+					cycles_to_execute -= elapsed_ticks;
+					internal_cycles_debt -= elapsed_ticks;
+
+					// Отсчитываем такты до кадрового прерывания 50 Гц
+					cpu.cycles_until_interrupt -= elapsed_ticks;
+					if (cpu.cycles_until_interrupt <= 0) {
+						cpu.int_pending = true; // Выставляем запрос на прерывание для процессора
+						cpu.cycles_until_interrupt += 35600; // На запуск следующего кадра
+
+						// Автоматическое плавное отжатие экранных кнопок GUI (раз в 20 мс)
+						if (static_virtual_key_duration > 0) {
+							static_virtual_key_duration--;
+							if (static_virtual_key_duration == 0) {
+								rk_rus_lat_pressed = false;
+								rk_cc_pressed = false;
+								rk_us_pressed = false;
+								for (int i = 0; i < 8; i++) key_matrix_state[i] = 0xFF;
+							}
+						}
+
+						// Обновляем графику и окна отладки строго 1 раз по завершении кадра
 						UpdateRegisterDisplay();
 						InvalidateRect(hwnd, NULL, FALSE);
 					}
 				}
 			}
-			TranslateMessage(&msg);
-			DispatchMessageW(&msg);
 		}
-		else {
-			// Эмуляция реального времени процессора (1.78 МГц)
-			LARGE_INTEGER current_hardware_time;
-			QueryPerformanceCounter(&current_hardware_time);
-			double elapsed_seconds = (double)(current_hardware_time.QuadPart - last_hardware_time.QuadPart) / frequency.QuadPart;
-			last_hardware_time = current_hardware_time;
 
-			if (elapsed_seconds > 0.1) elapsed_seconds = 0.1;
-
-			const double SYSTEM_CLOCK_HZ = 1780000.0;
-			internal_cycles_debt += elapsed_seconds * SYSTEM_CLOCK_HZ;
-
-			int steps_to_execute = (int)internal_cycles_debt;
-			if (steps_to_execute > 0) {
-				for (int i = 0; i < steps_to_execute; i++) {
-					cpu.Step();
-				}
-				internal_cycles_debt -= steps_to_execute;
-				UpdateRegisterDisplay();
-				InvalidateRect(hwnd, NULL, FALSE);
-			}
-			else {
-				Sleep(1); // Защита от 100% загрузки ядра CPU
-			}
+		if (internal_cycles_debt <= 0.0) {
+			Sleep(1); // Освобождаем CPU ПК
 		}
 	}
 
