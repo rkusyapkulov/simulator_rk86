@@ -22,6 +22,10 @@ const int CHAR_WIDTH = 6;
 #define IDM_FILE_OPEN  0x0010  // Изменено: строго меньше 0xF000 для системного меню!
 #define IDM_FILE_EXIT  0x0020
 
+#define BIOS_START_ADDRESS 0xF800  // 0xE000 for "peace.dos"
+#define BIOS_SIZE 2048 // 8192 for "peace.dos"
+#define BIOS_NAME L"bios.bin" // "peace.dos" for peace.dos
+
 // --- ГЛОБАЛЬНЫЕ БУФЕРЫ ПАМЯТИ ---
 BYTE system_ram[65536];    // Полное адресное пространство 64 Кб
 BYTE font_rom[2048];       // ПЗУ Знакогенератора (2 Кб)
@@ -34,6 +38,9 @@ bool rk_cc_pressed = false;       // CC (Shift) -> Подключена к PC5
 bool rk_us_pressed = false;       // УС (Ctrl)  -> Подключена к PC6
 bool rk_rus_lat_pressed = false;  // РУС/ЛАТ    -> Подключена к PC7
 
+// --- ЭМУЛЯЦИЯ БИПЕРА INTE ---
+bool rk_inte_speaker_state = false; // Текущее состояние динамика от INTE
+
 HWND hRegListBox = NULL;   // Дескриптор окна вывода регистров
 
 // --- ПАРАМЕТРЫ ЗВУКОВОГО ПОТОКА КР580ВИ53 ---
@@ -43,13 +50,19 @@ WAVEHDR waveHeader[2];
 short* audioBuffers[2] = { NULL, NULL };
 const int AUDIO_BUF_SIZE = 1024;
 
+// --- ДОБАВИТЬ: Кольцевой буфер синхронизации INTE ---
+const int INTE_RING_BUF_SIZE = 16384;
+short inte_ring_buffer[INTE_RING_BUF_SIZE] = { 0 };
+volatile int inte_ring_write_ptr = 0;
+volatile int inte_ring_read_ptr = 0;
+
 #pragma pack(push, 1)
 struct CPU8080 {
 	BYTE A, B, C, D, E, H, L;
 	WORD PC, SP;
 	bool S, Z, AC, P, CY;
 	bool EI;
-	bool halted; // <-- ДОБАВИТЬ: флаг останова процессора
+	bool halted; // флаг останова процессора
 	int cycles_until_interrupt = 35600; // 1780000 Гц / 50 Гц = 35600 тактов на кадр
 	bool int_pending = false;           // Флаг того, что прерывание пришло от дисплея
 
@@ -84,7 +97,7 @@ struct CPU8080 {
 	BYTE pit_control;
 
 	void Reset() {
-		PC = 0xE000; // Старт строго с начального адреса ПЗУ BIOS
+		PC = BIOS_START_ADDRESS; // Старт строго с начального адреса ПЗУ BIOS
 		SP = 0x0000;
 		A = B = C = D = E = H = L = 0;
 		S = Z = AC = P = CY = false;
@@ -102,6 +115,7 @@ struct CPU8080 {
 		vgh75_status = 0x00; vgh75_command = 0x00; vgh75_param_count = 0; vgh75_vblank_state = false;
 		for (int i = 0; i < 4; i++) vgh75_config[i] = 0;
 
+		rk_inte_speaker_state = false;
 		// Настройка таймера ВИ53
 		pit_control = 0x00;
 		for (int i = 0; i < 3; i++) {
@@ -163,7 +177,7 @@ struct CPU8080 {
 	}
 
 	BYTE Read(WORD addr) {
-		if (addr >= 0xE000) return system_ram[addr]; // Чтение BIOS ПЗУ
+		if (addr >= BIOS_START_ADDRESS) return system_ram[addr]; // Чтение BIOS ПЗУ
 
 		// Опрос КР580ВВ55 (ППА клавиатуры) (8000h - 9FFFh)
 		if (addr >= 0x8000 && addr <= 0x8003) {
@@ -394,49 +408,19 @@ struct CPU8080 {
 			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11  // F0-FF
 		};
 
-		if (int_pending) {
-			vgh75_vblank_state = !vgh75_vblank_state;
-			if (vgh75_vblank_state) {
-				vgh75_status |= 0x20; // Выставляем флаг конца кадра
-			}
-			else {
-				vgh75_status &= ~0x20;
-			}
-		}
-
 		// 1. Проверяем аппаратное прерывание перед декодированием инструкции
-		if (int_pending && EI) {
+		if (int_pending) {
 			int_pending = false;
-
-			BYTE opcode = system_ram[0x0038];
-			// УМНАЯ ЗАГЛУШКА: Если на векторе пусто или там RET, просто гасим триггер прерываний
-			if (opcode == 0x00 || opcode == 0xC9) {
-				EI = false; // КРИТИЧЕСКИ ВАЖНО: прерывания должны запрещаться при обработке!
-				halted = false; // Прерывание выводит процессор из HLT даже если там заглушка
-				return 4;   // Возвращаем базовые 4 такта (как на холостой цикл), а не 0!
-			}
-
-			// Честное аппаратное прерывание по стандарту Intel 8080 (эквивалент команды RST 7)
-			EI = false;
-			halted = false;
-			Write(--SP, PC >> 8);
-			Write(--SP, PC & 0xFF);
-			PC = 0x0038;
-			return 11; // RST 7 занимает ровно 11 тактов
+			halted = false; // Прерывание кадра ВСЕГДА пробуждает процессор из состояния HLT
 		}
 
 		// 2. Если процессор в состоянии HLT
 		if (halted) {
-			int_pending = false; // Если прерывания запрещены, HLT вечный, но кадровый счетчик сбрасываем
 			return 4; // Будем возвращать по 4 такта
 		}
 
-//        WORD current_pc_before_fetch = PC; // Сохраняем адрес текущей инструкции
 		BYTE op = Read(PC++);
 		int cycles = lut_cycles[op];
-
-		// СОХРАНЯЕМ ТЕКУЩИЙ ШАГ В ЦИКЛИЧЕСКИЙ БУФЕР
-//        LogTraceStep(current_pc_before_fetch, op, SP, GetHL(), GetBC(), GetDE(), A);
 
 		// Группа команд MOV r1, r2 (исключая MOV M, M, которая является HLT 0x76)
 		if ((op & 0xC0) == 0x40 && op != 0x76) {
@@ -644,8 +628,9 @@ struct CPU8080 {
 		case 0xE3: { BYTE l = Read(SP); BYTE h = Read(SP + 1); Write(SP, L); Write(SP + 1, H); L = l; H = h; return cycles; }
 		case 0xF9: SP = GetHL(); return cycles;
 		case 0xE9: PC = GetHL(); return cycles;
-		case 0xFB: EI = true; return cycles;
-		case 0xF3: EI = false; return cycles;
+
+		case 0xFB: EI = true; rk_inte_speaker_state = true; return cycles;  // EI включает INTE
+		case 0xF3: EI = false; rk_inte_speaker_state = false; return cycles; // DI выключает INTE
 		}
 		return cycles;
 	}
@@ -666,8 +651,8 @@ bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_by
 
 void LoadRoms() {
 	cpu.Reset();
-	if (!LoadRawBinaryFile(L"peace.dos", &system_ram[0xE000], 8192)) {
-		MessageBoxW(NULL, L"Критическая ошибка: Не удалось открыть peace.dos!", L"Ошибка", MB_OK | MB_ICONERROR);
+	if (!LoadRawBinaryFile(BIOS_NAME, &system_ram[BIOS_START_ADDRESS], BIOS_SIZE)) {
+		MessageBoxW(NULL, L"Критическая ошибка: Не удалось открыть bios.bin!", L"Ошибка", MB_OK | MB_ICONERROR);
 	}
 	if (!LoadRawBinaryFile(L"font.bin", font_rom, 2048)) {
 		MessageBoxW(NULL, L"Критическая ошибка: Не удалось открыть font.bin!", L"Ошибка", MB_OK | MB_ICONERROR);
@@ -922,6 +907,10 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	case VK_SPACE:  target_idx = 58; break; // ПРОБЕЛ
 
 		// --- УПРАВЛЯЮЩИЙ БЛОК ПК И СТРЕЛКИ ---
+	case VK_F1:    target_idx = 61; break; // Кнопка F1
+	case VK_F2:    target_idx = 66; break; // Кнопка F2
+	case VK_F3:    target_idx = 67; break; // Кнопка F3
+	case VK_F4:    target_idx = 68; break; // Кнопка F4
 	case VK_LEFT:  target_idx = 63; break;
 	case VK_UP:    target_idx = 64; break;
 	case VK_RIGHT: target_idx = 65; break;
@@ -1110,14 +1099,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // Генерирование звука через КР580ВИ53 на основе накопленной фазы частоты
 void FillAudioBuffer(short* buffer, int samplesCount) {
-	// Входная тактовая частота таймера КР580ВИ53 на Радио-86РК
 	const double PIT_CLOCK_HZ = 1780000.0;
-
-	// Сколько тиков таймера приходится на один звуковой семпл звуковой карты ПК (1024 раз в буфер)
-	// Для 22050 Гц это примерно 1780000 / 22050 = 80.725623... тиков на семпл
 	const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
-
-	// Внутренний статический аккумулятор дробной части тиков, чтобы фаза не уплывала между вызовами буферов
 	static double ticks_accumulator = 0.0;
 
 	for (int i = 0; i < samplesCount; i++) {
@@ -1125,7 +1108,6 @@ void FillAudioBuffer(short* buffer, int samplesCount) {
 		int ticks_to_consume = (int)ticks_accumulator;
 		ticks_accumulator -= ticks_to_consume;
 
-		// Если за этот звуковой квант времени тики не накопились, дублируем предыдущее значение
 		if (ticks_to_consume <= 0) {
 			buffer[i] = (i > 0) ? buffer[i - 1] : 0;
 			continue;
@@ -1134,48 +1116,46 @@ void FillAudioBuffer(short* buffer, int samplesCount) {
 		int active_channels = 0;
 		int mixed_signal = 0;
 
-		// Обрабатываем все 3 независимых звуковых канала КР580ВИ53
+		// 1. Эмуляция каналов КР580ВИ53 (остается оригинальной)
 		for (int ch = 0; ch < 3; ch++) {
 			CPU8080::PITChannel& channel = cpu.pit_channels[ch];
 			WORD divisor = channel.count;
 			BYTE mode = channel.mode & 7;
 
-			// Звук в КР580ВИ53 генерируется преимущественно в Режиме 2 (Генератор частоты) 
-			// или Режиме 3 (Генератор меандра). Делитель ниже 4 физически не может звучать.
 			if (divisor > 3 && (mode == 2 || mode == 3)) {
-
-				// Переводим double фазу во внутренний вычитающий счетчик тиков, если это первая итерация
-				// Для этого используем переменную phase как внутренний таймер текущего полупериода
 				if (channel.phase <= 0.0 || channel.phase > (double)divisor) {
-					channel.phase = (double)(divisor / 2); // Инициализируем полупериод меандра
+					channel.phase = (double)(divisor / 2);
 				}
-
-				// Эмулируем прохождение тактов процессора Orion для этого канала
 				channel.phase -= (double)ticks_to_consume;
-
-				// Переключение состояния полярности меандра при пересечении нуля счетчиком
 				if (channel.phase <= 0.0) {
-					// Восстанавливаем счётчик полупериода на основе текущего делителя частоты канала
 					channel.phase += (double)(divisor / 2);
-
-					// Инвертируем полярность выхода (используем переменную latched как триггер знака, 
-					// так как в режиме генерации звука оригинальный регистр фиксации latch уже не нужен)
 					channel.latched = !channel.latched;
 				}
-
-				// Добавляем вклад канала: меандр со значением +1 или -1
 				mixed_signal += channel.latched ? 1 : -1;
 				active_channels++;
 			}
 		}
 
-		// Если есть активные каналы, нормируем амплитуду до безопасных 16-битных значений 
-		// (6000 единиц громкости на канал для исключения перегрузки и хрипов звукового тракта)
-		if (active_channels > 0) {
-			buffer[i] = (short)((mixed_signal * 6000) / active_channels);
+		// 2. Извлечение СИНХРОННОГО сигнала INTE из кольцевого буфера
+		int inte_signal = 0;
+		if (inte_ring_read_ptr != inte_ring_write_ptr) {
+			inte_signal = inte_ring_buffer[inte_ring_read_ptr];
+			inte_ring_read_ptr = (inte_ring_read_ptr + 1) % INTE_RING_BUF_SIZE;
 		}
 		else {
-			buffer[i] = 0; // Полная тишина, если таймеры выключены программой
+			// Если буфер пуст, берем последнее состояние (стабилизация)
+			inte_signal = rk_inte_speaker_state ? 4000 : -4000;
+		}
+
+		// 3. Микширование сигналов
+		if (active_channels > 0) {
+			// Нормализуем меандр ВИ53 к значениям громкости и прибавляем сигнал INTE
+			int vi53_signal = mixed_signal * 5000 / active_channels;
+			buffer[i] = (short)((vi53_signal + inte_signal) / 2);
+		}
+		else {
+			// Работает только чистый бипер INTE
+			buffer[i] = (short)inte_signal;
 		}
 	}
 }
@@ -1187,6 +1167,10 @@ void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWO
 		waveOutWrite(hwo, pHdr, sizeof(WAVEHDR));
 	}
 }
+
+static double audio_ticks_accumulator = 0.0;
+const double PIT_CLOCK_HZ = 1780000.0;
+const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 	LoadRoms();
@@ -1297,11 +1281,37 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 					cycles_to_execute -= elapsed_ticks;
 					internal_cycles_debt -= elapsed_ticks;
 
+					// Накапливаем процессорные такты для генерации звука
+					audio_ticks_accumulator += elapsed_ticks;
+					while (audio_ticks_accumulator >= TICKS_PER_SAMPLE) {
+						audio_ticks_accumulator -= TICKS_PER_SAMPLE;
+
+						// Генерируем сэмпл на основе ТЕКУЩЕГО состояния флага прямо сейчас
+						short sample = rk_inte_speaker_state ? 4000 : -4000;
+
+						// Записываем в кольцевой буфер
+						int next_write = (inte_ring_write_ptr + 1) % INTE_RING_BUF_SIZE;
+						// Защита от переполнения буфера
+						if (next_write != inte_ring_read_ptr) {
+							inte_ring_buffer[inte_ring_write_ptr] = sample;
+							inte_ring_write_ptr = next_write;
+						}
+					}
+
 					// Отсчитываем такты до кадрового прерывания 50 Гц
 					cpu.cycles_until_interrupt -= elapsed_ticks;
 					if (cpu.cycles_until_interrupt <= 0) {
 						cpu.int_pending = true; // Выставляем запрос на прерывание для процессора
 						cpu.cycles_until_interrupt += 35600; // На запуск следующего кадра
+
+						// Синхронное переключение флага VBlank видеоконтроллера ВГ75
+						cpu.vgh75_vblank_state = !cpu.vgh75_vblank_state;
+						if (cpu.vgh75_vblank_state) {
+							cpu.vgh75_status |= 0x20;        // Конец кадра (VRTC)
+						}
+						else {
+							cpu.vgh75_status &= ~0x20;
+						}
 
 						// Автоматическое плавное отжатие экранных кнопок GUI (раз в 20 мс)
 						if (static_virtual_key_duration > 0) {
