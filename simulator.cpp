@@ -916,6 +916,7 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	case VK_RIGHT: target_idx = 65; break;
 	case VK_DOWN:  target_idx = 69; break;
 	case VK_HOME:  target_idx = 60; break; // "в угол"
+	case VK_PRIOR:  target_idx = 62; break; // СТР (Page Up)
 	}
 
 	if (target_idx != -1) {
@@ -1097,10 +1098,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	return 0;
 }
 
+const double PIT_CLOCK_HZ = 1780000.0;
+const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
+
 // Генерирование звука через КР580ВИ53 на основе накопленной фазы частоты
 void FillAudioBuffer(short* buffer, int samplesCount) {
-	const double PIT_CLOCK_HZ = 1780000.0;
-	const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
 	static double ticks_accumulator = 0.0;
 
 	for (int i = 0; i < samplesCount; i++) {
@@ -1169,8 +1171,6 @@ void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWO
 }
 
 static double audio_ticks_accumulator = 0.0;
-const double PIT_CLOCK_HZ = 1780000.0;
-const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 	LoadRoms();
