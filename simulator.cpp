@@ -762,7 +762,7 @@ void CreateKeyboardUI(HWND hwndParent, HINSTANCE hInst) {
 		L"УС", L"Ф\nF", L"Ы\nY", L"В\nW", L"А\nA", L"П\nP", L"Р\nR", L"О\nO", L"Л\nL", L"Д\nD", L"Ж\n\\V", L"Э\n\\", L".\n>", L"ЗБ", L"",
 		L"СС", L"Я\nQ", L"Ч\n^", L"С\nS", L"М\nM", L"И\nI", L"Т\nT", L"Ь\nX", L"Б\nB", L"Ю\n@", L",\n<", L"/\n?", L"РУС\nЛАТ", L"[ _ ]", L"[ _ ]"
 	};
-	static const wchar_t* side_labels[] = { L" ", L"F1", L"СТР", L"←", L"↑", L"→", L"F2", L"F3", L"F4", L"↓", L"AP2", L"" };
+	static const wchar_t* side_labels[] = { L"↖", L"F1", L"СТР", L"←", L"↑", L"→", L"F2", L"F3", L"F4", L"↓", L"AP2", L"" };
 
 	for (int idx = 0; idx < 60; idx++) {
 		int r = idx / 15; int c = idx % 15; int current_id = 1000 + idx;
@@ -849,7 +849,7 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	int target_idx = -1;
 	switch (vkCode) {
 		// --- ЦИФРОВОЙ РЯД ПК ---
-	case 0xC0: target_idx = 0;  break; // Клавиша ` / Ё  -> мапим на [;] (Index 0)
+	case 0xBB: target_idx = 26;  break; // Клавиша ` / Ё  -> мапим на [;] (Index 26)
 	case '1':  target_idx = 1;  break;
 	case '2':  target_idx = 2;  break;
 	case '3':  target_idx = 3;  break;
@@ -896,8 +896,10 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 		// --- ПУНКТУАЦИЯ И СПЕЦСИМВОЛЫ ---
 	case 0xDB: target_idx = 22; break; // Клавиша [ { -> мапим на Ш / [ (Index 22)
 	case 0xDD: target_idx = 23; break; // Клавиша ] } -> мапим на Щ / ] (Index 23)
-	case 0xBA: target_idx = 26; break; // Клавиша ; : -> мапим на : / * (Index 26)
-	case 0xDE: target_idx = 41; break; // Клавиша ' " -> мапим на Э / \ (Index 41)
+	case 0xBA: target_idx = 54; break; // Клавиша ; : -> мапим на : / * (Index 54)
+	case 0xDE: target_idx = 47; break; // Клавиша ' " -> мапим на Э / \ (Index 47)
+	case 0xDC: target_idx = 41; break; // Клавиша ' " -> мапим на Э / \ (Index 41)
+	case 0xC0: target_idx = 0; break; // Клавиша ' " -> мапим на Э / \ (Index 0)
 	case 0xBC: target_idx = 55; break; // Клавиша , < -> мапим на РК-шную запятую (Index 55)
 	case 0xBE: target_idx = 42; break; // Клавиша . > -> мапим на . / > (Index 42)
 	case 0xBF: target_idx = 56; break; // Клавиша / ? -> мапим на РК-шный слэш (Index 56)
