@@ -59,7 +59,7 @@ volatile int inte_ring_write_ptr = 0;
 volatile int inte_ring_read_ptr = 0;
 
 #ifndef PIT_CLOCK_HZ
-#define PIT_CLOCK_HZ 2500000   // частота CLK таймера; подставьте значение из схемы вашего Ориона
+#define PIT_CLOCK_HZ 1780000   // частота CLK таймера
 #endif
 
 static uint16_t pit_bcd2bin(uint16_t v) {
