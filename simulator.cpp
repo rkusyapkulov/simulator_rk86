@@ -908,8 +908,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 	QueryPerformanceFrequency(&frequency);
 	QueryPerformanceCounter(&last_hardware_time);
 
-	double time_since_last_interrupt = 0.0;
-
 	while (emulator_running) {
 		// Ожидание системных событий во избежание 100% загрузки процессора ПК
 		MsgWaitForMultipleObjectsEx(0, NULL, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
