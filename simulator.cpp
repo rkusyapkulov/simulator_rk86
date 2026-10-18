@@ -3,16 +3,14 @@
 #define _UNICODE
 #include <windows.h>
 #include <mmsystem.h>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <cstdlib>
-#include <cwchar>
-#include <cmath>
-#include <commdlg.h> // Обязательно проверьте наличие этого инклуда вверху файла
+#include <commdlg.h>
 #include "8080.h"
 
+#pragma comment (lib, "libcmt.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment (lib, "User32.lib")
+#pragma comment (lib, "Gdi32.lib")
+#pragma comment (lib, "Comdlg32.lib")
 
 extern "C" int cpu8080_step(CPU8080* cpu);
 extern "C" void cpu8080_reset(CPU8080* cpu);
@@ -359,11 +357,25 @@ HWND button_matrix;
 
 // --- ЗАГРУЗКА И КОРРЕКТИРОВКА РОМОВ ---
 bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_bytes) {
-	std::ifstream file(filepath, std::ios::binary);
-	if (!file.is_open()) return false;
-	file.read(reinterpret_cast<char*>(target_dest), max_bytes);
-	file.close();
-	return true;
+	// Открываем файл через Win32 API
+	HANDLE hFile = CreateFileW(
+		filepath, 
+		GENERIC_READ, 
+		FILE_SHARE_READ, 
+		NULL, 
+		OPEN_EXISTING, 
+		FILE_ATTRIBUTE_NORMAL, 
+		NULL
+	);
+	
+	if (hFile == INVALID_HANDLE_VALUE) return false;
+
+	DWORD bytesRead = 0;
+	// Читаем файл напрямую в буфер памяти
+	BOOL success = ReadFile(hFile, target_dest, (DWORD)max_bytes, &bytesRead, NULL);
+	
+	CloseHandle(hFile);
+	return success && (bytesRead > 0);
 }
 
 void LoadRoms() {
@@ -385,19 +397,19 @@ void LoadRoms() {
 void UpdateRegisterDisplay() {
 	SendMessageW(hRegListBox, LB_RESETCONTENT, 0, 0);
 	wchar_t buf[64];
-	swprintf(buf, 64, L" PC: %04Xh SP: %04Xh", cpu.PC, cpu.SP); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" PC: %04Xh SP: %04Xh", cpu.PC, cpu.SP); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" REG A: %02Xh PSW: %02Xh", cpu.A, (cpu.S << 7) | (cpu.Z << 6) | (cpu.AC << 4) | (cpu.P << 2) | 1 | cpu.CY); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" REG A: %02Xh PSW: %02Xh", cpu.A, (cpu.S << 7) | (cpu.Z << 6) | (cpu.AC << 4) | (cpu.P << 2) | 1 | cpu.CY); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" REG B: %02Xh REG C: %02Xh", cpu.B, cpu.C); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" REG B: %02Xh REG C: %02Xh", cpu.B, cpu.C); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" REG D: %02Xh REG E: %02Xh", cpu.D, cpu.E); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" REG D: %02Xh REG E: %02Xh", cpu.D, cpu.E); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" REG H: %02Xh REG L: %02Xh", cpu.H, cpu.L); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" REG H: %02Xh REG L: %02Xh", cpu.H, cpu.L); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" Флаги: S:%d Z:%d AC:%d P:%d CY:%d", cpu.S, cpu.Z, cpu.AC, cpu.P, cpu.CY); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" Флаги: S:%d Z:%d AC:%d P:%d CY:%d", cpu.S, cpu.Z, cpu.AC, cpu.P, cpu.CY); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 	buf[0] = L'\0';
-	swprintf(buf, 64, L" DMA (ВТ57): %04Xh", cpu.dma_ch_addr[2]); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+	wsprintfW(buf, L" DMA (ВТ57): %04Xh", cpu.dma_ch_addr[2]); SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 }
 
 // =========================================================================
@@ -663,34 +675,53 @@ void LoadRKFile(HWND hwnd) {
 	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 
 	if (GetOpenFileNameW(&ofn) == TRUE) {
-		std::ifstream file(ofn.lpstrFile, std::ios::binary);
-		if (!file.is_open()) {
+		// Открываем .RK файл средствами ОС Windows
+		HANDLE hFile = CreateFileW(
+			ofn.lpstrFile, 
+			GENERIC_READ, 
+			FILE_SHARE_READ, 
+			NULL, 
+			OPEN_EXISTING, 
+			FILE_ATTRIBUTE_NORMAL, 
+			NULL
+		);
+
+		if (hFile == INVALID_HANDLE_VALUE) {
 			MessageBoxW(hwnd, L"Не удалось открыть файл!", L"Ошибка", MB_OK | MB_ICONERROR);
 			return;
 		}
 
-		// Читаем начальный адрес (2 байта, Big Endian в формате .RK)
-		BYTE start_h = file.get();
-		BYTE start_l = file.get();
-		WORD start_addr = (start_h << 8) | start_l;
+		// Читаем заголовок (2 байта старт + 2 байта конец = 4 байта)
+		BYTE header[4];
+		DWORD bytesRead = 0;
+		
+		if (!ReadFile(hFile, header, 4, &bytesRead, NULL) || bytesRead < 4) {
+			MessageBoxW(hwnd, L"Неверный формат или поврежденный .RK файл!", L"Ошибка", MB_OK | MB_ICONERROR);
+			CloseHandle(hFile);
+			return;
+		}
 
-		// Читаем конечный адрес (2 байта, Big Endian)
-		BYTE end_h = file.get();
-		BYTE end_l = file.get();
-		WORD end_addr = (end_h << 8) | end_l;
+		// Распаковываем Big Endian адреса
+		WORD start_addr = (WORD)((header[0] << 8) | header[1]);
+		WORD end_addr   = (WORD)((header[2] << 8) | header[3]);
 
-		if (file.eof() || start_addr > end_addr || end_addr > 0x7FFF) {
+		if (start_addr > end_addr || end_addr > 0x7FFF) {
 			MessageBoxW(hwnd, L"Неверный формат или поврежденный .RK файл!\nЗагрузка выше 7FFFh запрещена.", L"Ошибка", MB_OK | MB_ICONERROR);
-			file.close();
+			CloseHandle(hFile);
 			return;
 		}
 
 		// Вычисляем размер блока данных
-		size_t data_size = end_addr - start_addr + 1;
+		DWORD data_size = (DWORD)(end_addr - start_addr + 1);
 
 		// Считываем бинарные данные напрямую в эмулируемое системное ОЗУ
-		file.read(reinterpret_cast<char*>(&system_ram[start_addr]), data_size);
-		file.close();
+		if (!ReadFile(hFile, &system_ram[start_addr], data_size, &bytesRead, NULL) || bytesRead < data_size) {
+			MessageBoxW(hwnd, L"Ошибка при чтении данных из файла!", L"Ошибка", MB_OK | MB_ICONERROR);
+			CloseHandle(hFile);
+			return;
+		}
+		
+		CloseHandle(hFile);
 
 		// Аппаратный запуск: перенаправляем указатель инструкций (PC) на старт программы
 		cpu.PC = start_addr;
@@ -701,7 +732,7 @@ void LoadRKFile(HWND hwnd) {
 		InvalidateRect(hwnd, NULL, FALSE);
 
 		wchar_t success_msg[128];
-		swprintf(success_msg, 128, L"Файл успешно загружен!\nАдреса: %04Xh - %04Xh\nПереход на %04Xh выполнен.", start_addr, end_addr, start_addr);
+		wsprintfW(success_msg, L"Файл успешно загружен!\nАдреса: %04Xh - %04Xh\nПереход на %04Xh выполнен.", start_addr, end_addr, start_addr);
 		MessageBoxW(hwnd, success_msg, L"Успех", MB_OK | MB_ICONINFORMATION);
 	}
 }
