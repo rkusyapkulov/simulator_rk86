@@ -116,14 +116,14 @@ void cpu8080_reset(CPU8080* cpu)
     cpu->pit_control = 0;
 
     // Настройка дефолтных значений ПДП
-    for (int i = 0; i < 4; i++) { cpu->dma_ch_addr[i] = 0; cpu->dma_ch_count[i] = 0; }
+    for (i = 0; i < 4; i++) { cpu->dma_ch_addr[i] = 0; cpu->dma_ch_count[i] = 0; }
     cpu->dma_ch_addr[2] = 0x76D0; // Канал 2 по умолчанию отвечает за экран РК
     cpu->dma_command = 0; cpu->dma_status = 0; cpu->dma_flip_flop = false;
 
     // Настройка видеоконтроллера
     cpu->vgh75_status = 0x00; cpu->vgh75_command = 0x00; cpu->vgh75_param_count = 0; cpu->vgh75_vblank_state = false;
     cpu->vgh75_cursor_col = cpu->vgh75_cursor_row = cpu->vgh75_cursor_type = 0;
-    for (int i = 0; i < 4; i++) cpu->vgh75_config[i] = 0;
+    for (i = 0; i < 4; i++) cpu->vgh75_config[i] = 0;
 
     for (i = 0; i < 3; ++i) {
         cpu->pit_channels[i].count = 0;
