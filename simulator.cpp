@@ -35,6 +35,7 @@ BYTE font_rom[2048];       // ПЗУ Знакогенератора (2 Кб)
 BYTE rom_disk_storage[32768]; // Буфер для хранения файла "rom.bin"
 BYTE key_matrix_state[8];  // Состояние шин клавиатуры (Индекс = Столбец PA, Биты = Строки PB)
 bool emulator_running = true;
+uint32_t frame_counter = 0; // Добавлено: глобальный счетчик кадров для мигания
 
 // Состояния модификаторов (true = нажато/заземлено, false = разомкнуто)
 bool rk_cc_pressed = false;       // CC (Shift) -> Подключена к PC5
@@ -306,24 +307,44 @@ extern "C" void cpu8080_write(CPU8080* cpu, uint16_t addr, uint8_t val) {
 		return;
 	}
 
-	// --- Write to КР580ВГ75 (CRT Controller) at C000h - DFFFh ---
-	if (addr >= 0xC000 && addr <= 0xDFFF) {
-		WORD reg = addr & 1;
-		if (reg == 1) { // Command Port
+	// --- ИСПРАВЛЕНО: КР580ВГ75 (Видеоконтроллер). Ловит OUT C0/C1 и STA 7500/7501 ---
+	if ((addr >= 0xC000 && addr <= 0xDFFF) || (addr >= 0x7500 && addr <= 0x75FF)) {
+		WORD reg = addr & 1; // 0 = Данные (C000h / 7500h), 1 = Команды (C001h / 7501h)
+
+		if (reg == 1) {
+			// --- ЗАПИСЬ КОМАНДЫ ---
 			cpu->vgh75_command = val;
-			cpu->vgh75_param_count = 0; // Reset parameter index phase
-			if ((val & 0xFC) == 0x00) {
-				cpu->vgh75_status &= ~0x20; // Clear internal error/vblank flags
+			cpu->vgh75_param_count = 0; // Сброс фазы автомата параметров!
+
+			if ((val & 0xF0) == 0x00) {
+				cpu->vgh75_status &= ~0x20; // Сброс флага кадра для Reset команды
 			}
 		}
-		else if (reg == 0) { // Parameter Data Port
-			if (cpu->vgh75_param_count < 4) {
-				cpu->vgh75_config[cpu->vgh75_param_count++] = val;
-				if (cpu->vgh75_param_count == 4) {
-					cpu->vgh75_status |= 0x00; // Setup completed successfully
+		else {
+			// --- ЗАПИСЬ ПАРАМЕТРОВ ---
+			uint8_t cmd_base = cpu->vgh75_command;
+
+			if ((cmd_base & 0xF0) == 0x00) {
+				// Команда 0x00: Инициализация (4 байта)
+				if (cpu->vgh75_param_count < 4) {
+					cpu->vgh75_config[cpu->vgh75_param_count] = val;
+					cpu->vgh75_param_count++;
+				}
+			}
+			else if ((cmd_base & 0x80) == 0x80) {
+				// Команда 0x80: ЗАГРУЗКА КУРСОРA (Ожидает строго 2 байта)
+				if (cpu->vgh75_param_count == 0) {
+					cpu->vgh75_cursor_col = val; // Убираем маску &0x3F, сохраняем сырую колонку ВГ75 (0-77)
+					cpu->vgh75_param_count = 1;
+				}
+				else if (cpu->vgh75_param_count == 1) {
+					cpu->vgh75_cursor_row = val & 0x3F; // Расширяем маску до 0x3F (ВГ75 поддерживает до 64 строк)
+					cpu->vgh75_cursor_type = (val >> 6) & 3;
+					cpu->vgh75_param_count = 2;
 				}
 			}
 		}
+		return;
 	}
 
 	// --- Write to КР580ВТ57 (DMA Controller) at E000h - F7FFh ---
@@ -414,10 +435,10 @@ void UpdateRegisterDisplay() {
 
 // =========================================================================
 //   ФУНКЦИЯ ПРЕЦИЗИОННОГО ВЫВОДА ЭКРАНА С УЧЕТОМ СИНХРОБАЙТОВ ВГ75
-//   СОХРАНЯЕТ ОРИГИНАЛЬНЫЙ ЦИКЛ (ЧЕРНЫЙ ФОН, БЕЛЫЙ ШРИФТ)
+//   И АППАРАТНОЙ ОБРАБОТКОЙ ВСЕХ ТИПОВ КУРСОРA (ПОДЧЕРКИВАНИЕ / ИНВЕРСИЯ)
 // =========================================================================
 void RenderScreen(HDC hdc, int xOffset, int yOffset) {
-	WORD screen_ram_start = cpu.dma_ch_addr[2];
+	WORD screen_ram_start = cpu.dma_ch_addr[2]; // Исправлено: чтение из правильного индекса массива
 	if (screen_ram_start == 0 || screen_ram_start > 0x7FFF) screen_ram_start = 0x76D0;
 
 	const int RK_STRIDE = 78;
@@ -425,6 +446,25 @@ void RenderScreen(HDC hdc, int xOffset, int yOffset) {
 	const int RK_START_COL = 8;
 	const int tex_width = SCREEN_COLS * CHAR_WIDTH;
 	const int tex_height = SCREEN_ROWS * CHAR_HEIGHT;
+
+	// Извлекаем позицию и тип курсора из регистров ВГ75
+	int cursor_col = cpu.vgh75_cursor_col;
+	int cursor_row = cpu.vgh75_cursor_row;
+	int cursor_type = cpu.vgh75_cursor_type; // 0: миг. подч., 1: стат. подч., 2: миг. инв., 3: стат. инв.
+
+	// Бит 4 четвертого байта конфигурации (vgh75_config[3]) определяет поведение:
+	// Если Бит 4 == 0 -> Курсор разрешен в автоматическом режиме.
+	// Если Бит 4 == 1 -> Курсор управляется вручную (Монитор РК использует именно этот режим).
+	// Однако, если ВГ75 вообще еще не инициализирован (все нули), курсор должен быть скрыт.
+	bool cursor_enabled = (cpu.vgh75_config[3] != 0);
+
+	// Глобальная фаза мигания (каждые 16 кадров)
+	extern uint32_t frame_counter;
+	bool blink_phase = ((frame_counter / 16) % 2) == 0;
+
+	// Определяем, должен ли курсор проявлять себя в данном кадре с точки зрения мигания
+	bool is_blink_type = (cursor_type == 0 || cursor_type == 2);
+	bool cursor_visible_now = cursor_enabled && (!is_blink_type || blink_phase);
 
 	static DWORD pixel_buffer[384 * 200];
 	for (int i = 0; i < 384 * 200; i++) pixel_buffer[i] = 0x00000000;
@@ -438,19 +478,36 @@ void RenderScreen(HDC hdc, int xOffset, int yOffset) {
 
 			if (code >= 0xF0) break;
 
-			// ПРАВИЛЬНАЯ ФИЛЬТРАЦИЯ АТРИБУТОВ ВГ75 ДЛЯ ИНВЕРТИРОВАННОГО ШРИФТА:
-			// Вместо continue (который сдвигал строки) или 0x20 (который рисовал белые квадраты),
-			// мы используем логический флаг пустого символа, чтобы прорисовать пустой черный блок.
 			bool is_attribute = (code >= 0x80 && code <= 0x9F);
 
+			// --- ИСПРАВЛЕНО: Сравнение по абсолютным координатам ВГ75 ---
+			// Монитор шлет строку с учетом RK_START_ROW, а колонку с учетом RK_START_COL.
+			bool is_cursor_cell = cursor_visible_now &&
+				(col == cursor_col) &&
+				((row + RK_START_ROW) == cursor_row);
+
 			for (int line = 0; line < CHAR_HEIGHT; line++) {
-				// Если это служебный атрибут ВГ75, подставляем пустую инвертированную строку (0xFF),
-				// чтобы при проверке "== 0" этот пиксель пропустился и остался черным.
 				BYTE font_byte = is_attribute ? 0xFF : font_rom[(code << 3) + line];
 
 				int pixel_y = (tex_height - 1) - (row * CHAR_HEIGHT + line);
 				for (int bit = 0; bit < CHAR_WIDTH; bit++) {
-					if ((font_byte & (0x20 >> bit)) == 0) {
+					bool pixel_active = (font_byte & (0x20 >> bit)) == 0;
+
+					// Обработка типов курсора ВГ75
+					if (is_cursor_cell) {
+						if (cursor_type == 2 || cursor_type == 3) {
+							// Типы 2 и 3: Полная инверсия всего знакоместа
+							pixel_active = !pixel_active;
+						}
+						else if (cursor_type == 0 || cursor_type == 1) {
+							// Типы 0 и 1: Подчеркивание. Линия рисуется на самом нижнем пиксельном ряду (CHAR_HEIGHT - 1)
+							if (line == (CHAR_HEIGHT - 1)) {
+								pixel_active = true; // Зажигаем пиксели нижней линии независимо от шрифта
+							}
+						}
+					}
+
+					if (pixel_active) {
 						int pixel_x = visible_col * CHAR_WIDTH + bit;
 						if (pixel_x < tex_width && pixel_y >= 0 && pixel_y < tex_height) {
 							pixel_buffer[pixel_y * tex_width + pixel_x] = 0x00FFFFFF;
@@ -1032,6 +1089,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 					cpu.cycles_until_interrupt -= elapsed_ticks;
 					if (cpu.cycles_until_interrupt <= 0) {
 						cpu.cycles_until_interrupt += 35600; // На запуск следующего кадра
+
+						frame_counter++; // ДОБАВЛЕНО: увеличиваем счетчик кадров каждые 20 мс
 
 						// Синхронное переключение флага VBlank видеоконтроллера ВГ75
 						cpu.vgh75_vblank_state = !cpu.vgh75_vblank_state;

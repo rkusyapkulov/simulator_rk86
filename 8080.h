@@ -65,6 +65,9 @@ typedef struct {
     uint8_t vgh75_param_count;
     uint8_t vgh75_config[4];
     bool vgh75_vblank_state;
+    uint8_t vgh75_cursor_col;
+    uint8_t vgh75_cursor_row;
+    uint8_t vgh75_cursor_type;
 
     // Состояние КР580ВИ53 (Таймер/Звук)
     PITChannel pit_channels[3];             // Три независимых канала таймера
